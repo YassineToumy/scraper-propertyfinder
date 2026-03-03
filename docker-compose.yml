@@ -3,7 +3,14 @@ services:
     build: .
     container_name: scraper-propertyfinder
     restart: unless-stopped
-    env_file:
-      - .env
+    environment:
+      - MONGODB_URI=${MONGODB_URI}
+      - MONGO_PROPERTYFINDER_DB=${MONGO_PROPERTYFINDER_DB:-propertyfinder}
+      - MONGO_PROPERTYFINDER_COL=${MONGO_PROPERTYFINDER_COL:-locations}
+      - POSTGRES_DSN=${POSTGRES_DSN}
+      - PG_TABLE_PROPERTYFINDER=${PG_TABLE_PROPERTYFINDER:-propertyfinder_listings}
+      - PG_ARCHIVE_PROPERTYFINDER=${PG_ARCHIVE_PROPERTYFINDER:-propertyfinder_archive}
+      - BATCH_SIZE=${BATCH_SIZE:-500}
+      - CYCLE_SLEEP=${CYCLE_SLEEP:-86400}
     volumes:
       - ./logs:/app/logs
