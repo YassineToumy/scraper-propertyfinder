@@ -1,0 +1,9 @@
+services:
+  propertyfinder:
+    build: .
+    container_name: scraper-propertyfinder
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
