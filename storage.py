@@ -109,3 +109,22 @@ def upload_images(source, ad_id, img_urls, timeout=20):
         for i, url in enumerate(img_urls)
         if url
     ]
+
+
+def upload_image_from_bytes(source, ad_id, img_url, data, content_type="image/jpeg", index=0):
+    """Upload pre-downloaded image bytes to B2. Returns B2 URL or original URL on failure."""
+    if not _b2_configured() or not data:
+        return img_url
+    try:
+        s3 = _get_s3()
+        key = _make_key(source, str(ad_id), img_url, index)
+        try:
+            s3.head_object(Bucket=B2_BUCKET, Key=key)
+            return _public_url(key)
+        except ClientError:
+            pass
+        s3.put_object(Bucket=B2_BUCKET, Key=key, Body=data, ContentType=content_type)
+        return _public_url(key)
+    except Exception as e:
+        log.warning(f"B2 upload failed for {img_url[:80]}: {e}")
+        return img_url

@@ -19,7 +19,9 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from pymongo import MongoClient, UpdateOne
 from dotenv import load_dotenv
-from storage import upload_images
+from storage import upload_image_from_bytes, _b2_configured
+import logging
+log = logging.getLogger("scraper")
 
 load_dotenv()
 
@@ -305,7 +307,7 @@ def parse_detail(html: str, url: str) -> dict:
             if hi not in raw_images:
                 raw_images.append(hi)
     raw_images = raw_images[:20]
-    images = upload_images("propertyfinder", prop_id or url, raw_images)
+    images = raw_images  # uploaded later via Playwright context
 
     agent_name, agency_name = None, None
     prov = soup.find(string=re.compile(r"Provided by"))
@@ -366,6 +368,30 @@ def parse_detail(html: str, url: str) -> dict:
 # SCRAPER
 # ══════════════════════════════════════════════════════════════════
 
+async def _upload_images_via_page(page, prop_id, raw_images):
+    """Download images through Playwright (has session cookies) and upload to B2."""
+    if not _b2_configured() or not raw_images:
+        return raw_images
+    results = []
+    for i, img_url in enumerate(raw_images):
+        if not img_url:
+            continue
+        try:
+            resp = await page.request.get(img_url)
+            if resp.ok:
+                data = await resp.body()
+                ct = (resp.headers.get("content-type") or "image/jpeg").split(";")[0]
+                b2_url = upload_image_from_bytes("propertyfinder", prop_id, img_url, data, ct, i)
+                results.append(b2_url)
+            else:
+                log.warning(f"Image fetch {resp.status} for {img_url[:80]}")
+                results.append(img_url)
+        except Exception as e:
+            log.warning(f"Image download failed: {e}")
+            results.append(img_url)
+    return results
+
+
 async def scrape_one_listing(page, url: str) -> dict | None:
     if not await goto(page, url):
         return None
@@ -377,7 +403,11 @@ async def scrape_one_listing(page, url: str) -> dict | None:
     html = await page.content()
     if "EGP" not in html:
         return None
-    return parse_detail(html, url)
+    doc = parse_detail(html, url)
+    if doc and doc.get("images"):
+        prop_id = doc.get("property_id") or url
+        doc["images"] = await _upload_images_via_page(page, prop_id, doc["images"]) or None
+    return doc
 
 
 async def scrape_zone(page, zone_name: str, zone_url: str, col, scraped: set, stats: dict):
