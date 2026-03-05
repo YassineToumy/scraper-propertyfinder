@@ -19,6 +19,7 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 from pymongo import MongoClient, UpdateOne
 from dotenv import load_dotenv
+from storage import upload_images
 
 load_dotenv()
 
@@ -296,14 +297,15 @@ def parse_detail(html: str, url: str) -> dict:
         district = parts[-2] if len(parts) >= 2 else None
         compound = parts[0] if len(parts) >= 3 else None
 
-    images = []
+    raw_images = []
     for img in soup.find_all("img", src=re.compile(r"static\.shared\.propertyfinder")):
         src = img.get("src", "")
         if "/listing/" in src:
             hi = re.sub(r"/\d+x\d+\.", "/1200x800.", src)
-            if hi not in images:
-                images.append(hi)
-    images = images[:20]
+            if hi not in raw_images:
+                raw_images.append(hi)
+    raw_images = raw_images[:20]
+    images = upload_images("propertyfinder", prop_id or url, raw_images)
 
     agent_name, agency_name = None, None
     prov = soup.find(string=re.compile(r"Provided by"))
