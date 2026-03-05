@@ -368,16 +368,21 @@ def parse_detail(html: str, url: str) -> dict:
 # SCRAPER
 # ══════════════════════════════════════════════════════════════════
 
-async def _upload_images_via_page(page, prop_id, raw_images):
-    """Download images through Playwright (has session cookies) and upload to B2."""
+async def _upload_images_via_page(page, prop_id, raw_images, listing_url=""):
+    """Download images through Playwright with Referer and upload to B2."""
     if not _b2_configured() or not raw_images:
         return raw_images
+    referer = listing_url or "https://www.propertyfinder.eg/"
     results = []
     for i, img_url in enumerate(raw_images):
         if not img_url:
             continue
         try:
-            resp = await page.request.get(img_url)
+            resp = await page.request.get(img_url, headers={
+                "Referer": referer,
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
             if resp.ok:
                 data = await resp.body()
                 ct = (resp.headers.get("content-type") or "image/jpeg").split(";")[0]
@@ -406,7 +411,7 @@ async def scrape_one_listing(page, url: str) -> dict | None:
     doc = parse_detail(html, url)
     if doc and doc.get("images"):
         prop_id = doc.get("property_id") or url
-        doc["images"] = await _upload_images_via_page(page, prop_id, doc["images"]) or None
+        doc["images"] = await _upload_images_via_page(page, prop_id, doc["images"], url) or None
     return doc
 
 
