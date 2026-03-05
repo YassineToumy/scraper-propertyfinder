@@ -368,37 +368,32 @@ def parse_detail(html: str, url: str) -> dict:
 # SCRAPER
 # ══════════════════════════════════════════════════════════════════
 
-async def _upload_images_via_page(page, prop_id, raw_images, listing_url=""):
-    """Download images through Playwright with Referer and upload to B2."""
-    if not _b2_configured() or not raw_images:
-        return raw_images
-    referer = listing_url or "https://www.propertyfinder.eg/"
-    results = []
-    for i, img_url in enumerate(raw_images):
-        if not img_url:
-            continue
-        try:
-            resp = await page.request.get(img_url, headers={
-                "Referer": referer,
-                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            })
-            if resp.ok:
-                data = await resp.body()
-                ct = (resp.headers.get("content-type") or "image/jpeg").split(";")[0]
-                b2_url = upload_image_from_bytes("propertyfinder", prop_id, img_url, data, ct, i)
-                results.append(b2_url)
-            else:
-                log.warning(f"Image fetch {resp.status} for {img_url[:80]}")
-                results.append(img_url)
-        except Exception as e:
-            log.warning(f"Image download failed: {e}")
-            results.append(img_url)
-    return results
-
-
 async def scrape_one_listing(page, url: str) -> dict | None:
+    # Intercept images as the browser loads them — browser has CDN session/cookies
+    captured = {}  # image_uuid -> (bytes, content_type)
+
+    async def _capture_image(route, request):
+        try:
+            response = await route.fetch()
+            if response.ok:
+                body = await response.body()
+                ct = (response.headers.get("content-type") or "image/jpeg").split(";")[0]
+                # URL format: .../listing/{LISTING_ID}/{IMAGE_UUID}/{RESOLUTION}.jpg
+                parts = request.url.rstrip("/").split("/")
+                uuid = parts[-2] if len(parts) >= 2 else ""
+                if uuid and uuid not in captured:
+                    captured[uuid] = (body, ct)
+            await route.fulfill(response=response)
+        except Exception:
+            await route.continue_()
+
+    await page.route(
+        lambda u: "static.shared.propertyfinder.eg" in u and "/listing/" in u,
+        _capture_image,
+    )
+
     if not await goto(page, url):
+        await page.unroute_all()
         return None
     try:
         await page.wait_for_selector("h1", timeout=10000)
@@ -406,12 +401,27 @@ async def scrape_one_listing(page, url: str) -> dict | None:
         await asyncio.sleep(3)
     await scroll(page)
     html = await page.content()
+    await page.unroute_all()
+
     if "EGP" not in html:
         return None
+
     doc = parse_detail(html, url)
-    if doc and doc.get("images"):
+    if doc and doc.get("images") and _b2_configured():
         prop_id = doc.get("property_id") or url
-        doc["images"] = await _upload_images_via_page(page, prop_id, doc["images"], url) or None
+        uploaded = []
+        for i, img_url in enumerate(doc["images"]):
+            parts = img_url.rstrip("/").split("/")
+            uuid = parts[-2] if len(parts) >= 2 else ""
+            item = captured.get(uuid)
+            if item:
+                data, ct = item
+                b2_url = upload_image_from_bytes("propertyfinder", prop_id, img_url, data, ct, i)
+                uploaded.append(b2_url)
+            else:
+                log.warning(f"Image not captured for {img_url[:80]}")
+                uploaded.append(img_url)
+        doc["images"] = uploaded or None
     return doc
 
 
