@@ -6,7 +6,12 @@ echo "🇪🇬 PropertyFinder Service Starting"
 echo "   Time: $(date -u)"
 echo "══════════════════════════════════════════════════"
 
-printenv | grep -v "no_proxy" >> /etc/environment
+# Export env vars with proper shell quoting (URIs with @ ? & break plain sourcing)
+env | while IFS='=' read -r k v; do
+    [[ "$k" == "no_proxy" || "$k" == "_" ]] && continue
+    printf 'export %s=%q\n' "$k" "$v"
+done > /app/.env_runtime
+printenv | grep -v -E "^(no_proxy|_)=" >> /etc/environment
 
 cat > /etc/cron.d/propertyfinder <<'CRON'
 SHELL=/bin/bash
@@ -14,6 +19,9 @@ PATH=/usr/local/bin:/usr/bin:/bin
 
 # Scraper — every 6h (Playwright browser, slow — needs multiple passes)
 0 */6 * * * root /app/runner.sh scraper >> /app/logs/cron.log 2>&1
+
+# Cleaner — every 6h, 30 min after scraper
+30 */6 * * * root /app/runner.sh cleaner >> /app/logs/cron.log 2>&1
 
 # Sync to PostgreSQL — every 24h at 11:00 UTC
 0 11 * * * root /app/runner.sh sync >> /app/logs/cron.log 2>&1
@@ -23,8 +31,9 @@ CRON
 chmod 0644 /etc/cron.d/propertyfinder
 
 echo "✅ Cron schedule installed:"
-echo "   */6h   🕷️  Scraper (every 6 hours — Playwright)"
-echo "   11:00  🔄 Sync to PostgreSQL (daily)"
+echo "   */6h      🕷️  Scraper (every 6 hours — Playwright)"
+echo "   */6h+30m  🧹 Cleaner (after scraper)"
+echo "   11:00     🔄 Sync to PostgreSQL (daily)"
 echo ""
 
 echo "🔌 Testing MongoDB..."
@@ -50,8 +59,9 @@ conn.close()
 echo ""
 echo "🔄 Running initial jobs on startup..."
 
-/app/runner.sh scraper || echo "⚠️  Scraper startup failed — will retry via cron"
-/app/runner.sh sync || echo "⚠️  Sync startup failed — will retry via cron"
+/app/runner.sh scraper  || echo "⚠️  Scraper startup failed — will retry via cron"
+/app/runner.sh cleaner  || echo "⚠️  Cleaner startup failed — will retry via cron"
+/app/runner.sh sync     || echo "⚠️  Sync startup failed — will retry via cron"
 
 echo "══════════════════════════════════════════════════"
 echo "✅ Startup complete — cron daemon starting"
