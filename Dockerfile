@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install Chromium (playwright already available from base image)
 RUN playwright install chromium --with-deps
 
-COPY scraper.py cleaner.py sync.py storage.py ./
+COPY scraper.py cleaner.py storage.py ./
 COPY entrypoint.sh /entrypoint.sh
 COPY runner.sh ./
 
