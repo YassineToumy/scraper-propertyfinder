@@ -23,9 +23,6 @@ PATH=/usr/local/bin:/usr/bin:/bin
 # Cleaner — every 6h, 30 min after scraper
 30 */6 * * * root /app/runner.sh cleaner >> /app/logs/cron.log 2>&1
 
-# Sync to PostgreSQL — every 24h at 11:00 UTC
-0 11 * * * root /app/runner.sh sync >> /app/logs/cron.log 2>&1
-
 CRON
 
 chmod 0644 /etc/cron.d/propertyfinder
@@ -33,7 +30,6 @@ chmod 0644 /etc/cron.d/propertyfinder
 echo "✅ Cron schedule installed:"
 echo "   */6h      🕷️  Scraper (every 6 hours — Playwright)"
 echo "   */6h+30m  🧹 Cleaner (after scraper)"
-echo "   11:00     🔄 Sync to PostgreSQL (daily)"
 echo ""
 
 echo "🔌 Testing MongoDB..."
@@ -46,22 +42,11 @@ print('  ✅ MongoDB OK')
 c.close()
 " || echo "  ❌ MongoDB connection failed"
 
-echo "🔌 Testing PostgreSQL..."
-python -c "
-import psycopg2, os
-conn = psycopg2.connect(os.environ['POSTGRES_DSN'])
-cur = conn.cursor()
-cur.execute('SELECT 1')
-print('  ✅ PostgreSQL OK')
-conn.close()
-" || echo "  ❌ PostgreSQL connection failed"
-
 echo ""
 echo "🔄 Running initial jobs on startup..."
 
 /app/runner.sh scraper  || echo "⚠️  Scraper startup failed — will retry via cron"
 /app/runner.sh cleaner  || echo "⚠️  Cleaner startup failed — will retry via cron"
-/app/runner.sh sync     || echo "⚠️  Sync startup failed — will retry via cron"
 
 echo "══════════════════════════════════════════════════"
 echo "✅ Startup complete — cron daemon starting"
