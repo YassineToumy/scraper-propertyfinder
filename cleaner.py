@@ -44,8 +44,115 @@ MAX_SURFACE = 2_000
 MAX_ROOMS   = 30
 
 # ============================================================
+# AMENITIES WHITELIST
+# Canonical names stored in DB — matched case-insensitively.
+# Only strings present in this set survive the filter.
+# ============================================================
+
+_AMENITY_WHITELIST: set[str] = {
+    # ── Pool / Water ──────────────────────────────────────────
+    "Shared Pool", "Private Pool", "Children's Pool", "Indoor Pool",
+    "Infinity Pool", "Swimming Pool", "Rooftop Pool", "Lap Pool",
+    # ── Gym / Sports ──────────────────────────────────────────
+    "Shared Gym", "Private Gym", "Gym", "Fitness Center",
+    "Basketball Court", "Tennis Court", "Squash Court",
+    "Jogging Track", "Cycling Track", "Sports Court",
+    # ── Security ──────────────────────────────────────────────
+    "Security", "CCTV", "Intercom", "Guarded", "24/7 Security",
+    "Electronic Security", "Card Access System", "Security Cameras",
+    # ── Views ─────────────────────────────────────────────────
+    "View of Water", "View of Landmark", "City View", "Garden View",
+    "Pool View", "Sea View", "Nile View", "Golf View", "Park View",
+    "Street View",
+    # ── Parking ───────────────────────────────────────────────
+    "Covered Parking", "Underground Parking", "Parking",
+    "Valet Parking", "Visitor Parking", "Garage",
+    # ── Interior features ─────────────────────────────────────
+    "Storage Room", "Maids Room", "Study", "Walk-in Closet",
+    "Built-in Wardrobes", "Wardrobe", "Laundry Room",
+    "Kitchen Appliances", "Open Kitchen", "Pantry",
+    # ── Outdoor / Private ─────────────────────────────────────
+    "Balcony", "Terrace", "Private Garden", "Private Terrace",
+    "Roof Terrace", "Shared Garden", "Garden", "Courtyard", "Patio",
+    # ── Utilities / Tech ──────────────────────────────────────
+    "Central A/C", "Central AC", "Air Conditioning", "District Cooling",
+    "Solar Panels", "Smart Home", "High-speed Internet",
+    "Satellite/Cable TV", "Satellite TV",
+    # ── Building features ─────────────────────────────────────
+    "Lobby in Building", "Concierge", "Elevator", "Maintenance Staff",
+    "Waste Disposal", "Service Elevators", "Reception", "Shared Lobby",
+    # ── Community / Leisure ───────────────────────────────────
+    "Children's Play Area", "Barbecue Area", "Cafeteria",
+    "Community Center", "Mosque", "Nursery", "School",
+    "Shopping Mall", "Supermarket", "Retail Outlets",
+    "Restaurants", "Cafes",
+    # ── Furnishing ────────────────────────────────────────────
+    "Furnished", "Partly Furnished", "Unfurnished", "Semi-furnished",
+    # ── Wellness ──────────────────────────────────────────────
+    "Jacuzzi", "Sauna", "Steam Room", "Spa", "Club House", "Clubhouse",
+    "Conference Room", "Business Center", "Co-working Space",
+    "Pet-friendly",
+    # ── Beach / Waterfront ────────────────────────────────────
+    "Beach Access", "Waterfront", "Marina", "Private Beach",
+}
+
+# Lowercase lookup → canonical name
+_AMENITY_LOWER: dict[str, str] = {a.lower(): a for a in _AMENITY_WHITELIST}
+
+# Furnishing keywords (used to populate is_furnished from amenities)
+_FURNISHED_KEYS = {
+    "furnished":        True,
+    "partly furnished": "partial",
+    "semi-furnished":   "partial",
+    "unfurnished":      False,
+}
+
+
+# ============================================================
 # CLEANING HELPERS
 # ============================================================
+
+RE_HTML       = re.compile(r"<[^>]+>")
+RE_BOILERPLATE = re.compile(
+    r"(SaveShareReport|Save\s*Share\s*Report|See full description"
+    r"|Powered by DataGuru|DataGuru|Community Insights"
+    r"|No reviews yet|out of\s*\d+\s*rating)",
+    re.IGNORECASE,
+)
+
+
+def clean_amenities(raw: list) -> list[str]:
+    """
+    Filter a raw amenities array, keeping only known real-estate features.
+    Returns a deduplicated list of canonical feature names (original casing).
+    """
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        key = item.strip().lower()
+        canonical = _AMENITY_LOWER.get(key)
+        if canonical and canonical not in seen:
+            seen.add(canonical)
+            result.append(canonical)
+    return result
+
+
+def furnished_from_amenities(raw: list) -> bool | str | None:
+    """Extract furnishing status from raw amenities list."""
+    if not isinstance(raw, list):
+        return None
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        val = _FURNISHED_KEYS.get(item.strip().lower())
+        if val is not None:
+            return val
+    return None
+
 
 def parse_price(doc: dict) -> tuple[float | None, str]:
     """Return (price_monthly_egp, currency)."""
@@ -87,11 +194,12 @@ def parse_bedrooms(doc: dict) -> int | None:
 
 
 def clean_description(raw: str | None) -> str | None:
-    """Strip HTML, decode entities, normalize accents."""
+    """Strip HTML tags, decode entities, normalize accents (é→e, à→a)."""
     if not raw:
         return None
-    text = re.sub(r"<[^>]+>", " ", raw)
+    text = RE_HTML.sub(" ", raw)
     text = html.unescape(text)
+    text = RE_BOILERPLATE.sub("", text)
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -104,16 +212,14 @@ def clean_document(doc: dict) -> dict:
 
     source_id = doc.get("property_id") or doc.get("reference")
     if not source_id:
-        # Derive from URL
         m = re.search(r"-([A-Za-z0-9]{5,})\.html$", doc.get("url", ""))
         source_id = m.group(1) if m else None
-    c["source_id"]       = str(source_id) if source_id else None
-    c["source"]          = "propertyfinder"
-    c["country"]         = "EG"
+    c["source_id"]        = str(source_id) if source_id else None
+    c["source"]           = "propertyfinder"
+    c["country"]          = "EG"
     c["transaction_type"] = "rent"
-    c["reference"]       = doc.get("reference")
-
-    c["url"] = doc.get("url")
+    c["reference"]        = doc.get("reference")
+    c["url"]              = doc.get("url")
 
     prop_type = (doc.get("property_type") or "").lower()
     type_map = {
@@ -123,7 +229,7 @@ def clean_document(doc: dict) -> dict:
     }
     c["property_type"] = type_map.get(prop_type, prop_type or None)
 
-    c["city"]     = doc.get("city")
+    c["city"]          = doc.get("city")
     c["district_name"] = doc.get("district")
 
     price, currency = parse_price(doc)
@@ -137,7 +243,14 @@ def clean_document(doc: dict) -> dict:
     c["bedrooms"]  = parse_bedrooms(doc)
     c["bathrooms"] = doc.get("bathrooms")
 
-    c["is_furnished"] = doc.get("furnished") == "furnished"
+    # Furnishing: prefer explicit field, fall back to amenities array
+    raw_amenities = doc.get("amenities") or []
+    if doc.get("furnished") == "furnished":
+        c["is_furnished"] = True
+    else:
+        furnished_val = furnished_from_amenities(raw_amenities)
+        if furnished_val is not None:
+            c["is_furnished"] = furnished_val
 
     c["description"] = clean_description(doc.get("description"))
     c["title"]       = doc.get("title")
@@ -152,9 +265,10 @@ def clean_document(doc: dict) -> dict:
 
     c["agency_name"] = doc.get("agency_name")
 
-    amenities = doc.get("amenities")
-    if isinstance(amenities, list) and amenities:
-        c["features"] = amenities
+    # ── Amenities: keep only real features, discard navigation/metadata ──
+    features = clean_amenities(raw_amenities)
+    if features:
+        c["features"] = features
 
     if price and surface_m2 and surface_m2 > 0:
         c["price_per_m2"]   = round(price / surface_m2, 2)
@@ -206,7 +320,7 @@ def connect_db():
 
 
 def ensure_indexes(col):
-    col.create_index([("source_id", ASCENDING)], unique=True, name="source_id_unique")
+    col.create_index([("source_id", ASCENDING)], unique=True, sparse=True, name="source_id_unique")
     col.create_index([("city", ASCENDING)])
     col.create_index([("price", ASCENDING)])
     col.create_index([("surface_m2", ASCENDING)])
@@ -233,7 +347,7 @@ def insert_batch(col, batch: list) -> tuple[int, int]:
 
 
 # ============================================================
-# PIPELINE
+# PIPELINE  (cursor-safe: _id pagination, no long-lived cursor)
 # ============================================================
 
 def run(source_col, clean_col, dry_run=False):
@@ -249,18 +363,16 @@ def run(source_col, clean_col, dry_run=False):
     else:
         existing_ids = set()
 
-    # Build query using property_id or reference
+    base_query: dict = {}
     if existing_ids:
-        query = {"$and": [
+        base_query = {"$and": [
             {"$or": [
                 {"property_id": {"$nin": list(existing_ids)}},
                 {"reference":   {"$nin": list(existing_ids)}},
             ]}
         ]}
-    else:
-        query = {}
 
-    pending = source_col.count_documents(query)
+    pending = source_col.count_documents(base_query)
     print(f"   Pending: {pending}\n")
 
     if pending == 0:
@@ -273,10 +385,28 @@ def run(source_col, clean_col, dry_run=False):
         "invalid_surface": 0, "aberrant_rooms": 0, "errors": 0,
     }
 
-    batch = []
-    cursor = source_col.find(query, batch_size=BATCH_SIZE, no_cursor_timeout=True)
-    try:
-        for i, doc in enumerate(cursor):
+    processed = 0
+    last_id   = None
+    batch     = []
+
+    while True:
+        page_query = dict(base_query)
+        if last_id is not None:
+            # Inject _id filter inside existing $and, or wrap fresh
+            if "$and" in page_query:
+                page_query["$and"].append({"_id": {"$gt": last_id}})
+            else:
+                page_query["_id"] = {"$gt": last_id}
+
+        page = list(
+            source_col.find(page_query).sort("_id", ASCENDING).limit(BATCH_SIZE)
+        )
+        if not page:
+            break
+
+        last_id = page[-1]["_id"]
+
+        for doc in page:
             try:
                 cleaned = clean_document(doc)
                 stats["cleaned"] += 1
@@ -293,24 +423,25 @@ def run(source_col, clean_col, dry_run=False):
                     continue
 
                 batch.append(cleaned)
-                if len(batch) >= BATCH_SIZE:
-                    ins, upd = insert_batch(clean_col, batch)
-                    stats["inserted"] += ins
-                    stats["updated"]  += upd
-                    batch = []
-                    print(f"   {i+1}/{pending} cleaned …", end="\r", flush=True)
 
             except Exception as e:
                 stats["errors"] += 1
                 if stats["errors"] <= 5:
-                    print(f"\n   Error on {doc.get('property_id')}: {str(e)[:100]}")
+                    print(f"\n   Error on {doc.get('property_id')}: {str(e)[:120]}")
 
         if batch and not dry_run:
             ins, upd = insert_batch(clean_col, batch)
             stats["inserted"] += ins
             stats["updated"]  += upd
-    finally:
-        cursor.close()
+            batch = []
+
+        processed += len(page)
+        print(
+            f"   {processed}/{pending} — "
+            f"{stats['inserted']} inserted | {stats['updated']} updated | "
+            f"{stats['errors']} errors",
+            end="\r", flush=True,
+        )
 
     print_stats(stats, dry_run)
 
@@ -325,7 +456,8 @@ def print_stats(s, dry_run=False):
     rejected = s["cleaned"] - s["inserted"] - s["updated"]
     if rejected > 0:
         print(f"   Rejected:   {rejected}")
-        for k in ("invalid_price", "missing_source_id", "missing_city", "invalid_surface", "aberrant_rooms"):
+        for k in ("invalid_price", "missing_source_id", "missing_city",
+                  "invalid_surface", "aberrant_rooms"):
             if s.get(k):
                 print(f"      {k}: {s[k]}")
     if s["errors"]:
@@ -342,6 +474,8 @@ def show_sample(col, n=3):
                 print(f"   {k}: [{len(v)} urls]")
             elif k == "description":
                 print(f"   {k}: {str(v)[:80]}...")
+            elif k == "features":
+                print(f"   {k}: {v}")
             else:
                 print(f"   {k}: {v}")
 
