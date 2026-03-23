@@ -79,9 +79,6 @@ def save_batch(col, items: list[dict]) -> dict:
     now = datetime.now(timezone.utc)
     ops = []
     for li in items:
-        li["updated_at"] = now
-        li["type"] = "appartement"
-        li["category"] = "location"
         if li.get("property_id"):
             f = {"property_id": li["property_id"]}
         elif li.get("reference"):
@@ -90,7 +87,13 @@ def save_batch(col, items: list[dict]) -> dict:
             f = {"url": li["url"]}
         else:
             continue
-        ops.append(UpdateOne(f, {"$set": li, "$setOnInsert": {"first_seen": now, "scraped_at": now}}, upsert=True))
+        set_doc = {k: v for k, v in li.items() if k not in ("first_seen", "scraped_at")}
+        set_doc["updated_at"] = now
+        ops.append(UpdateOne(
+            f,
+            {"$set": set_doc, "$setOnInsert": {"first_seen": now, "scraped_at": now}},
+            upsert=True,
+        ))
     if not ops:
         return {"inserted": 0, "updated": 0}
     r = col.bulk_write(ops, ordered=False)
@@ -189,177 +192,160 @@ def get_urls_from_search(html: str) -> list[str]:
 
 def parse_detail(html: str, url: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
 
-    prop_id = None
-    m = re.search(r"-([A-Za-z0-9]{5,})\.html$", url)
-    if m:
-        prop_id = m.group(1)
-
-    h1 = soup.find("h1")
-    title = h1.get_text(strip=True) if h1 else None
-
-    price_raw, price_value, price_period = None, None, "monthly"
-    pm = re.search(r"EGP\s*([\d,]+)/month", text) or re.search(r"([\d,]+)\s*EGP/month", text)
-    if pm:
-        price_raw = pm.group(0)
+    # ── 1. __NEXT_DATA__ (primary source — most complete) ─────────────
+    prop = {}
+    nd_tag = soup.find("script", id="__NEXT_DATA__")
+    if nd_tag and nd_tag.string:
         try:
-            price_value = int(pm.group(1).replace(",", ""))
-        except ValueError:
+            nd = json.loads(nd_tag.string)
+            prop = (nd.get("props", {})
+                      .get("pageProps", {})
+                      .get("propertyResult", {})
+                      .get("property", {}))
+        except Exception:
             pass
-    if not price_value:
-        py = re.search(r"([\d,]+)\s*EGP/year", text)
-        if py:
-            price_raw, price_period = py.group(0), "yearly"
-            try:
-                price_value = int(py.group(1).replace(",", ""))
-            except ValueError:
-                pass
 
-    description = None
-    if h1:
-        parts = []
-        for sib in h1.find_all_next():
-            if sib.name in ("hr", "table") or sib.get_text(strip=True).startswith("Property details"):
-                break
-            if sib.name == "p" or (sib.name == "div" and len(sib.get_text(strip=True)) > 30):
-                t = sib.get_text("\n", strip=True)
-                if t and t != title and "See full description" not in t:
-                    parts.append(t)
-        if parts:
-            description = "\n".join(parts)
-    if not description:
-        for el in soup.find_all(["p", "div"]):
-            t = el.get_text(strip=True)
-            if len(t) > 100 and any(kw in t.lower() for kw in ["rent", "bedroom", "sqm", "sq m"]):
-                description = t
-                break
+    # ── 2. JSON-LD #plp-schema (description, amenities, geo, agent) ───
+    ld_main = {}
+    ld_tag = soup.find("script", id="plp-schema")
+    if ld_tag and ld_tag.string:
+        try:
+            ld = json.loads(ld_tag.string)
+            ld_main = ld.get("mainEntity", {}).get("mainEntity", {})
+        except Exception:
+            pass
 
-    property_type = None
-    ptm = re.search(r"Property Type\s*(\w[\w\s]*?)(?=Property Size|Bedrooms|$)", text)
-    if ptm:
-        property_type = ptm.group(1).strip()
+    # ── property_id ────────────────────────────────────────────────────
+    prop_id = str(prop["id"]) if prop.get("id") else None
+    if not prop_id:
+        m = re.search(r"-(\d+)\.html$", url)
+        prop_id = m.group(1) if m else None
 
-    property_size = None
-    sm = re.search(r"([\d,]+)\s*sqft\s*/\s*([\d,]+)\s*sqm", text)
-    if sm:
-        property_size = {"sqft": int(sm.group(1).replace(",", "")), "sqm": int(sm.group(2).replace(",", ""))}
-    else:
-        sm2 = re.search(r"([\d,]+)\s*sqm", text)
-        if sm2:
-            property_size = {"sqm": int(sm2.group(1).replace(",", ""))}
+    # ── title ──────────────────────────────────────────────────────────
+    title = prop.get("title") or ld_main.get("name")
+    if not title:
+        h1 = soup.find("h1")
+        title = h1.get_text(strip=True) if h1 else None
 
-    bedrooms = None
-    bm = re.search(r"Bedrooms?\s*(\d+)", text)
-    if bm:
-        bedrooms = int(bm.group(1))
+    # ── description (JSON-LD always has the real one) ──────────────────
+    description = ld_main.get("description") or prop.get("description")
 
-    bathrooms = None
-    btm = re.search(r"Bathrooms?\s*(\d+)", text)
-    if btm:
-        bathrooms = int(btm.group(1))
+    # ── price ──────────────────────────────────────────────────────────
+    price_data   = prop.get("price", {})
+    price_value  = price_data.get("value")
+    price_currency = price_data.get("currency", "EGP")
+    price_period = (price_data.get("period") or "monthly").lower()
 
-    available_from = None
-    am = re.search(r"Available from\s*(\d{1,2}\s\w+\s\d{4})", text)
-    if am:
-        available_from = am.group(1)
+    # Annual → monthly normalization
+    if price_period in ("yearly", "annual", "year") and price_value:
+        price_value  = round(price_value / 12)
+        price_period = "monthly"
 
-    amenities = []
-    asec = soup.find(string=re.compile(r"Amenities"))
-    if asec:
-        container = asec.find_parent()
-        if container:
-            for _ in range(5):
-                if container.parent:
-                    container = container.parent
-                    ct = [c.get_text(strip=True) for c in container.find_all(["span", "li", "div"]) if 2 < len(c.get_text(strip=True)) < 50]
-                    if len(ct) >= 3:
-                        amenities = [t for t in ct if t not in ("Amenities",) and not t.startswith("See all")]
-                        amenities = list(dict.fromkeys(amenities))
-                        break
-    if not amenities:
-        known = ["Furnished", "Balcony", "Built in Wardrobes", "Central A/C", "Covered Parking",
-                 "Kitchen Appliances", "Private Garden", "Study", "Shared Spa", "Security",
-                 "Swimming Pool", "Gym", "Elevator", "Maid's Room", "Storage Room", "Pets Allowed",
-                 "Concierge", "Children's Play Area", "BBQ Area", "Jacuzzi", "Sauna", "Steam Room",
-                 "View of Landmark", "View of Water", "Shared Pool", "Private Pool", "Internet"]
-        for a in known:
-            if a.lower() in text.lower():
-                amenities.append(a)
+    price_raw = f"{price_value} {price_currency}/{price_period}" if price_value else None
 
-    location_full, city, district, compound = None, None, None, None
-    lm = re.search(
-        r"([A-Z][\w\s\.]+(?:,\s*[A-Z][\w\s\.]+){1,5},\s*(?:Cairo|Giza|Alexandria|Red Sea|Suez|North Coast|South Sainai|Al Daqahlya|Qalyubia|Asyut))",
-        text,
-    )
-    if lm:
-        location_full = lm.group(1).strip()
-        parts = [p.strip() for p in location_full.split(",")]
-        city = parts[-1] if parts else None
-        district = parts[-2] if len(parts) >= 2 else None
-        compound = parts[0] if len(parts) >= 3 else None
+    # ── property type ──────────────────────────────────────────────────
+    property_type = prop.get("property_type")
 
-    raw_images = []
-    for img in soup.find_all("img", src=re.compile(r"static\.shared\.propertyfinder")):
-        src = img.get("src", "")
-        if "/listing/" in src:
-            hi = re.sub(r"/\d+x\d+\.", "/1200x800.", src)
-            if hi not in raw_images:
-                raw_images.append(hi)
-    raw_images = raw_images[:20]
-    images = raw_images  # uploaded later via Playwright context
+    # ── area ───────────────────────────────────────────────────────────
+    area_sqm = prop.get("area") or prop.get("size")
+    if not area_sqm:
+        fs = ld_main.get("floorSize", {})
+        if str(fs.get("unitText", "")).lower() == "sqm":
+            area_sqm = fs.get("value")
 
-    agent_name, agency_name = None, None
-    prov = soup.find(string=re.compile(r"Provided by"))
-    if prov:
-        c = prov.find_parent()
-        if c:
-            for _ in range(3):
-                c = c.parent if c.parent else c
-            for t in c.stripped_strings:
-                t = t.strip()
-                if len(t) <= 3 or t in ("Provided by", "Regulatory information") or t.startswith("See agency"):
-                    continue
-                if not agent_name:
-                    agent_name = t
-                elif not agency_name and t != agent_name:
-                    agency_name = t
-                    break
+    # ── bedrooms / bathrooms ───────────────────────────────────────────
+    bedrooms  = prop.get("bedrooms")  or prop.get("bedroom_count")
+    bathrooms = prop.get("bathrooms") or prop.get("bathroom_count")
+    if bedrooms is None or bathrooms is None:
+        text = soup.get_text(" ", strip=True)
+        if bedrooms is None:
+            bm = re.search(r"Bedrooms?\s*(\d+)", text)
+            if bm:
+                bedrooms = int(bm.group(1))
+        if bathrooms is None:
+            btm = re.search(r"Bathrooms?\s*(\d+)", text)
+            if btm:
+                bathrooms = int(btm.group(1))
 
-    reference = None
-    rm = re.search(r"Reference\s*([A-Z0-9]{10,})", text)
-    if rm:
-        reference = rm.group(1)
+    # ── location ───────────────────────────────────────────────────────
+    loc = prop.get("location", {})
+    location_full = loc.get("full_name") or ld_main.get("address", {}).get("name")
 
-    listed_date = None
-    ldm = re.search(r"Listed\s+(.+?)(?:\s*Call|\s*WhatsApp|\s*$)", text)
-    if ldm:
-        listed_date = ldm.group(1).strip()
+    # path_name: "القاهرة, مدينة القاهرة الجديدة, الرحاب, الرحاب المرحلة الأولى"
+    path_parts = [p.strip() for p in loc.get("path_name", "").split(",") if p.strip()]
+    city     = path_parts[0] if len(path_parts) > 0 else None
+    district = path_parts[1] if len(path_parts) > 1 else None
+    compound = path_parts[2] if len(path_parts) > 2 else None
 
-    price_insights = {}
-    cm = re.search(r"costs?\s*(\d+)%\s*(less|more)", text)
-    if cm:
-        price_insights["vs_avg_pct"] = int(cm.group(1))
-        price_insights["vs_avg_dir"] = cm.group(2)
-    arm = re.search(r"Average Rent is\s*([\d,]+)\s*EGP", text)
-    if arm:
-        price_insights["avg_rent"] = int(arm.group(1).replace(",", ""))
-    asm = re.search(r"Average size is\s*(\d+)\s*sqm", text)
-    if asm:
-        price_insights["avg_size"] = int(asm.group(1))
+    # ── coordinates ────────────────────────────────────────────────────
+    coords    = loc.get("coordinates", {})
+    latitude  = coords.get("lat")
+    longitude = coords.get("lon")
+    if latitude is None:
+        geo = ld_main.get("geo", {})
+        latitude  = geo.get("latitude")
+        longitude = geo.get("longitude")
+
+    # ── images (full resolution from structured data) ──────────────────
+    images = []
+    for img in prop.get("images", {}).get("property", []):
+        img_url = img.get("full") or img.get("medium")
+        if img_url and img_url not in images:
+            images.append(img_url)
+    images = images[:20] or None
+
+    # ── agent / agency (from JSON-LD offer) ────────────────────────────
+    agent  = None
+    agency = None
+    offers = ld_main.get("offers", [])
+    if offers:
+        offered_by  = offers[0].get("offeredBy", {})
+        agent_name  = offered_by.get("name")
+        agent_phone = offered_by.get("telephone")
+        agency_name = offered_by.get("parentOrganization", {}).get("name")
+        if agent_name:
+            agent = {"name": agent_name, "phone": agent_phone} if agent_phone else {"name": agent_name}
+        if agency_name:
+            agency = {"name": agency_name}
+
+    # ── amenities (from JSON-LD amenityFeature) ────────────────────────
+    amenities = [f["name"] for f in ld_main.get("amenityFeature", []) if f.get("value")]
+
+    # ── reference ──────────────────────────────────────────────────────
+    reference = prop.get("reference")
+
+    # ── furnished ──────────────────────────────────────────────────────
+    furnished = prop.get("furnishing") or prop.get("furnished")
 
     doc = {
-        "property_id": prop_id, "reference": reference, "title": title,
-        "description": description, "price_raw": price_raw, "price_value": price_value,
-        "currency": "EGP", "price_period": price_period, "property_type": property_type,
-        "property_size": property_size, "bedrooms": bedrooms, "bathrooms": bathrooms,
-        "available_from": available_from,
-        "furnished": "furnished" if "Furnished" in amenities else None,
-        "amenities": amenities or None, "location_full": location_full,
-        "city": city, "district": district, "compound": compound,
-        "images": images or None, "agent_name": agent_name, "agency_name": agency_name,
-        "listed_date": listed_date, "price_insights": price_insights or None,
-        "url": url, "source": "propertyfinder.eg",
+        "property_id":   prop_id,
+        "reference":     reference,
+        "title":         title,
+        "description":   description,
+        "price":         price_value,
+        "currency":      price_currency,
+        "price_period":  price_period,
+        "price_raw":     price_raw,
+        "type":          "apartment",
+        "category":      "rent",
+        "property_type": property_type,
+        "area_sqm":      area_sqm,
+        "bedrooms":      bedrooms,
+        "bathrooms":     bathrooms,
+        "furnished":     furnished,
+        "amenities":     amenities or None,
+        "location_full": location_full,
+        "city":          city,
+        "district":      district,
+        "compound":      compound,
+        "latitude":      latitude,
+        "longitude":     longitude,
+        "images":        images,
+        "agent":         agent,
+        "agency":        agency,
+        "url":           url,
+        "source":        "propertyfinder.eg",
     }
     return {k: v for k, v in doc.items() if v is not None}
 
