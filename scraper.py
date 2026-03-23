@@ -1,5 +1,6 @@
 """
-PropertyFinder.eg - Scraper Complet Appartements Location → MongoDB
+PropertyFinder.eg - Scraper Complet Location → MongoDB
+Tous types résidentiels + commerciaux (sauf terrain/land)
 Config via .env — HEADLESS mode for server deployment
 
 Prérequis:
@@ -26,24 +27,46 @@ log = logging.getLogger("scraper")
 load_dotenv()
 
 # ─── CONFIG — from .env ──────────────────────────────────────────
+# All rental types — Egypt-wide searches ordered by most recent
+# Land (t=5, c=4) excluded — terrain/land
+_BASE = "https://www.propertyfinder.eg/en/search?fu=0&ob=mr&rp=m"
 ZONES = [
-    ("New Cairo City", "https://www.propertyfinder.eg/en/rent/cairo/apartments-for-rent-new-cairo-city.html"),
-    ("Maadi", "https://www.propertyfinder.eg/en/rent/cairo/apartments-for-rent-hay-el-maadi.html"),
-    ("Nasr City", "https://www.propertyfinder.eg/en/rent/cairo/apartments-for-rent-nasr-city.html"),
-    ("Heliopolis", "https://www.propertyfinder.eg/en/rent/cairo/apartments-for-rent-heliopolis.html"),
-    ("Zamalek", "https://www.propertyfinder.eg/en/rent/cairo/apartments-for-rent-zamalek.html"),
-    ("Mokattam", "https://www.propertyfinder.eg/en/rent/cairo/apartments-for-rent-mokattam.html"),
-    ("Shorouk City", "https://www.propertyfinder.eg/en/rent/cairo/apartments-for-rent-shorouk-city.html"),
-    ("El Obour City", "https://www.propertyfinder.eg/en/rent/cairo/apartments-for-rent-el-obour-city.html"),
-    ("Cairo Other", "https://www.propertyfinder.eg/en/rent/cairo/apartments-for-rent.html"),
-    ("Sheikh Zayed", "https://www.propertyfinder.eg/en/rent/giza/apartments-for-rent-sheikh-zayed-city.html"),
-    ("6 October", "https://www.propertyfinder.eg/en/rent/giza/apartments-for-rent-6-october-city.html"),
-    ("Giza Other", "https://www.propertyfinder.eg/en/rent/giza/apartments-for-rent.html"),
-    ("Alexandria", "https://www.propertyfinder.eg/en/rent/alexandria/apartments-for-rent.html"),
-    ("Al Daqahlya", "https://www.propertyfinder.eg/en/rent/al-daqahlya/apartments-for-rent.html"),
-    ("Red Sea", "https://www.propertyfinder.eg/en/rent/red-sea/apartments-for-rent.html"),
-    ("North Coast", "https://www.propertyfinder.eg/en/rent/north-coast/apartments-for-rent.html"),
-    ("Suez", "https://www.propertyfinder.eg/en/rent/suez/apartments-for-rent.html"),
+    # ── Residential (c=2) ─────────────────────────────────────────
+    ("Apartments",              f"{_BASE}&c=2&t=1"),
+    ("Villas",                  f"{_BASE}&c=2&t=35"),
+    ("Duplexes",                f"{_BASE}&c=2&t=24"),
+    ("Penthouses",              f"{_BASE}&c=2&t=20"),
+    ("Townhouses",              f"{_BASE}&c=2&t=22"),
+    ("Twin Houses",             f"{_BASE}&c=2&t=46"),
+    ("iVillas",                 f"{_BASE}&c=2&t=50"),
+    ("Chalets",                 f"{_BASE}&c=2&t=44"),
+    ("Roofs",                   f"{_BASE}&c=2&t=53"),
+    ("Hotel Apartments",        f"{_BASE}&c=2&t=28"),
+    ("Whole Buildings Res.",    f"{_BASE}&c=2&t=10"),
+    ("Bungalows",               f"{_BASE}&c=2&t=31"),
+    ("Palaces",                 f"{_BASE}&c=2&t=52"),
+    ("Cabins",                  f"{_BASE}&c=2&t=51"),
+    ("Bulk Rent Units Res.",    f"{_BASE}&c=2&t=34"),
+    ("Half Floors Res.",        f"{_BASE}&c=2&t=29"),
+    # ── Commercial (c=4) ──────────────────────────────────────────
+    ("Offices",                 f"{_BASE}&c=4&t=4"),
+    ("Shops",                   f"{_BASE}&c=4&t=21"),
+    ("Clinics",                 f"{_BASE}&c=4&t=54"),
+    ("Whole Buildings Com.",    f"{_BASE}&c=4&t=10"),
+    ("Retail Spaces",           f"{_BASE}&c=4&t=27"),
+    ("Full Floors",             f"{_BASE}&c=4&t=18"),
+    ("Co-working Spaces",       f"{_BASE}&c=4&t=56"),
+    ("Warehouses",              f"{_BASE}&c=4&t=13"),
+    ("Villas Com.",             f"{_BASE}&c=4&t=35"),
+    ("Factories",               f"{_BASE}&c=4&t=45"),
+    ("Half Floors Com.",        f"{_BASE}&c=4&t=29"),
+    ("Restaurants",             f"{_BASE}&c=4&t=48"),
+    ("Showrooms",               f"{_BASE}&c=4&t=12"),
+    ("Cafeterias",              f"{_BASE}&c=4&t=55"),
+    ("Bulk Rent Units Com.",    f"{_BASE}&c=4&t=34"),
+    ("Medical Facilities",      f"{_BASE}&c=4&t=47"),
+    ("Staff Accommodation",     f"{_BASE}&c=4&t=43"),
+    ("iVillas Com.",            f"{_BASE}&c=4&t=50"),
 ]
 MAX_PAGES_PER_ZONE = 1000
 DELAY_SEARCH = (2, 5)
@@ -177,7 +200,8 @@ async def goto(page, url, timeout=30000):
 def get_urls_from_search(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     seen, urls = set(), []
-    for a in soup.find_all("a", href=re.compile(r"/plp/rent/apartment-")):
+    # Match any rental detail page — ends with numeric property ID
+    for a in soup.find_all("a", href=re.compile(r"/plp/rent/[^?#]+-\d+\.html")):
         href = a.get("href", "")
         full = href if href.startswith("http") else f"https://www.propertyfinder.eg{href}"
         if full not in seen:
@@ -327,7 +351,6 @@ def parse_detail(html: str, url: str) -> dict:
         "currency":      price_currency,
         "price_period":  price_period,
         "price_raw":     price_raw,
-        "type":          "apartment",
         "category":      "rent",
         "property_type": property_type,
         "area_sqm":      area_sqm,
@@ -427,7 +450,7 @@ async def scrape_zone(page, zone_name: str, zone_url: str, col, scraped: set, st
 
     for pg in range(1, MAX_PAGES_PER_ZONE + 1):
         try:
-            await page.wait_for_selector("a[href*='/plp/rent/apartment-']", timeout=15000)
+            await page.wait_for_selector("a[href*='/plp/rent/']", timeout=15000)
         except Exception:
             await asyncio.sleep(3)
 
@@ -476,8 +499,9 @@ async def scrape_zone(page, zone_name: str, zone_url: str, col, scraped: set, st
 
             await asyncio.sleep(random.uniform(*DELAY_DETAIL))
 
-        search_url_for_next_page = zone_url.split("?")[0]
-        next_search = f"{search_url_for_next_page}?page={pg + 1}"
+        # Keep all query params, just add/replace page number
+        base_no_page = re.sub(r"&page=\d+", "", zone_url)
+        next_search = f"{base_no_page}&page={pg + 1}"
 
         await asyncio.sleep(random.uniform(*DELAY_SEARCH))
 
