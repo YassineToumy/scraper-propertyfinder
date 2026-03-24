@@ -1,10 +1,11 @@
 """
 PropertyFinder.eg - Scraper Complet Location → MongoDB
 Tous types résidentiels + commerciaux (sauf terrain/land)
+Scraping bilingue EN + AR — même property_id, textes stockés avec suffixe _ar
 Config via .env — HEADLESS mode for server deployment
 
 Prérequis:
-    pip install playwright beautifulsoup4 pymongo python-dotenv
+    pip install playwright beautifulsoup4 pymongo python-dotenv requests
     playwright install chromium
 """
 
@@ -13,6 +14,7 @@ import asyncio
 import json
 import re
 import random
+import requests as _requests
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -151,6 +153,7 @@ async def make_browser(pw):
         viewport={"width": 1920, "height": 1080},
         locale="en-EG", timezone_id="Africa/Cairo",
         user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        extra_http_headers={"Accept-Language": "en-EG,en;q=0.9,ar;q=0.8"},
     )
     await ctx.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -200,24 +203,55 @@ async def goto(page, url, timeout=30000):
 def get_urls_from_search(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     seen, urls = set(), []
-    # Match any rental detail page — ends with numeric property ID
     for a in soup.find_all("a", href=re.compile(r"/plp/rent/[^?#]+-\d+\.html")):
         href = a.get("href", "")
         full = href if href.startswith("http") else f"https://www.propertyfinder.eg{href}"
+        # Always normalize to /en/ as the primary URL for deduplication
+        full = re.sub(r"/(ar|en)/plp/", "/en/plp/", full)
         if full not in seen:
             seen.add(full)
             urls.append(full)
     return urls
 
 
+async def fetch_ar_html(en_url: str) -> str | None:
+    """Fetch the Arabic version of a detail page via plain HTTP (PropertyFinder is SSR)."""
+    ar_url = en_url.replace("/en/plp/", "/ar/plp/")
+    try:
+        resp = await asyncio.to_thread(
+            _requests.get,
+            ar_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Language": "ar-EG,ar;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://www.propertyfinder.eg/ar/",
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        log.debug(f"AR page fetch failed for {ar_url}: {e}")
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════
 # EXTRACTION : PAGE DE DÉTAIL → DOCUMENT COMPLET
 # ══════════════════════════════════════════════════════════════════
 
-def parse_detail(html: str, url: str) -> dict:
+def parse_detail(html: str, url: str, lang: str = "en") -> dict:
+    """
+    Parse a PropertyFinder detail page.
+    lang="en" → primary doc with all shared fields + English text fields
+    lang="ar" → only Arabic text fields (title_ar, description_ar, …)
+                 to be merged into the primary doc via dict.update()
+    """
     soup = BeautifulSoup(html, "html.parser")
+    s = "_ar" if lang == "ar" else ""  # field name suffix
 
-    # ── 1. __NEXT_DATA__ (primary source — most complete) ─────────────
+    # ── 1. __NEXT_DATA__ ──────────────────────────────────────────────
     prop = {}
     nd_tag = soup.find("script", id="__NEXT_DATA__")
     if nd_tag and nd_tag.string:
@@ -230,7 +264,7 @@ def parse_detail(html: str, url: str) -> dict:
         except Exception:
             pass
 
-    # ── 2. JSON-LD #plp-schema (description, amenities, geo, agent) ───
+    # ── 2. JSON-LD #plp-schema ────────────────────────────────────────
     ld_main = {}
     ld_tag = soup.find("script", id="plp-schema")
     if ld_tag and ld_tag.string:
@@ -240,136 +274,116 @@ def parse_detail(html: str, url: str) -> dict:
         except Exception:
             pass
 
-    # ── property_id ────────────────────────────────────────────────────
-    prop_id = str(prop["id"]) if prop.get("id") else None
-    if not prop_id:
-        m = re.search(r"-(\d+)\.html$", url)
-        prop_id = m.group(1) if m else None
-
-    # ── title ──────────────────────────────────────────────────────────
+    # ── Text / localised fields (suffixed with _ar for Arabic) ────────
     title = prop.get("title") or ld_main.get("name")
     if not title:
         h1 = soup.find("h1")
         title = h1.get_text(strip=True) if h1 else None
 
-    # ── description (JSON-LD always has the real one) ──────────────────
     description = ld_main.get("description") or prop.get("description")
 
-    # ── price ──────────────────────────────────────────────────────────
-    price_data   = prop.get("price", {})
-    price_value  = price_data.get("value")
-    price_currency = price_data.get("currency", "EGP")
-    price_period = (price_data.get("period") or "monthly").lower()
-
-    # Annual → monthly normalization
-    if price_period in ("yearly", "annual", "year") and price_value:
-        price_value  = round(price_value / 12)
-        price_period = "monthly"
-
-    price_raw = f"{price_value} {price_currency}/{price_period}" if price_value else None
-
-    # ── property type ──────────────────────────────────────────────────
-    property_type = prop.get("property_type")
-
-    # ── area ───────────────────────────────────────────────────────────
-    area_sqm = prop.get("area") or prop.get("size")
-    if not area_sqm:
-        fs = ld_main.get("floorSize", {})
-        if str(fs.get("unitText", "")).lower() == "sqm":
-            area_sqm = fs.get("value")
-
-    # ── bedrooms / bathrooms ───────────────────────────────────────────
-    bedrooms  = prop.get("bedrooms")  or prop.get("bedroom_count")
-    bathrooms = prop.get("bathrooms") or prop.get("bathroom_count")
-    if bedrooms is None or bathrooms is None:
-        text = soup.get_text(" ", strip=True)
-        if bedrooms is None:
-            bm = re.search(r"Bedrooms?\s*(\d+)", text)
-            if bm:
-                bedrooms = int(bm.group(1))
-        if bathrooms is None:
-            btm = re.search(r"Bathrooms?\s*(\d+)", text)
-            if btm:
-                bathrooms = int(btm.group(1))
-
-    # ── location ───────────────────────────────────────────────────────
     loc = prop.get("location", {})
     location_full = loc.get("full_name") or ld_main.get("address", {}).get("name")
-
-    # path_name: "القاهرة, مدينة القاهرة الجديدة, الرحاب, الرحاب المرحلة الأولى"
     path_parts = [p.strip() for p in loc.get("path_name", "").split(",") if p.strip()]
     city     = path_parts[0] if len(path_parts) > 0 else None
     district = path_parts[1] if len(path_parts) > 1 else None
     compound = path_parts[2] if len(path_parts) > 2 else None
 
-    # ── coordinates ────────────────────────────────────────────────────
-    coords    = loc.get("coordinates", {})
-    latitude  = coords.get("lat")
-    longitude = coords.get("lon")
-    if latitude is None:
-        geo = ld_main.get("geo", {})
-        latitude  = geo.get("latitude")
-        longitude = geo.get("longitude")
-
-    # ── images (full resolution from structured data) ──────────────────
-    images = []
-    for img in prop.get("images", {}).get("property", []):
-        img_url = img.get("full") or img.get("medium")
-        if img_url and img_url not in images:
-            images.append(img_url)
-    images = images[:20] or None
-
-    # ── agent / agency (from JSON-LD offer) ────────────────────────────
-    agent  = None
-    agency = None
-    offers = ld_main.get("offers", [])
-    if offers:
-        offered_by  = offers[0].get("offeredBy", {})
-        agent_name  = offered_by.get("name")
-        agent_phone = offered_by.get("telephone")
-        agency_name = offered_by.get("parentOrganization", {}).get("name")
-        if agent_name:
-            agent = {"name": agent_name, "phone": agent_phone} if agent_phone else {"name": agent_name}
-        if agency_name:
-            agency = {"name": agency_name}
-
-    # ── amenities (from JSON-LD amenityFeature) ────────────────────────
+    property_type = prop.get("property_type")
     amenities = [f["name"] for f in ld_main.get("amenityFeature", []) if f.get("value")]
 
-    # ── reference ──────────────────────────────────────────────────────
-    reference = prop.get("reference")
-
-    # ── furnished ──────────────────────────────────────────────────────
-    furnished = prop.get("furnishing") or prop.get("furnished")
-
-    doc = {
-        "property_id":   prop_id,
-        "reference":     reference,
-        "title":         title,
-        "description":   description,
-        "price":         price_value,
-        "currency":      price_currency,
-        "price_period":  price_period,
-        "price_raw":     price_raw,
-        "category":      "rent",
-        "property_type": property_type,
-        "area_sqm":      area_sqm,
-        "bedrooms":      bedrooms,
-        "bathrooms":     bathrooms,
-        "furnished":     furnished,
-        "amenities":     amenities or None,
-        "location_full": location_full,
-        "city":          city,
-        "district":      district,
-        "compound":      compound,
-        "latitude":      latitude,
-        "longitude":     longitude,
-        "images":        images,
-        "agent":         agent,
-        "agency":        agency,
-        "url":           url,
-        "source":        "propertyfinder.eg",
+    # Build localised sub-doc
+    doc: dict = {
+        f"title{s}":         title,
+        f"description{s}":   description,
+        f"property_type{s}": property_type,
+        f"amenities{s}":     amenities or None,
+        f"location_full{s}": location_full,
+        f"city{s}":          city,
+        f"district{s}":      district,
+        f"compound{s}":      compound,
+        f"url{'_ar' if lang == 'ar' else ''}": url if lang == "ar" else None,
     }
+
+    # ── Shared fields — only from the English (primary) page ──────────
+    if lang == "en":
+        prop_id = str(prop["id"]) if prop.get("id") else None
+        if not prop_id:
+            m = re.search(r"-(\d+)\.html$", url)
+            prop_id = m.group(1) if m else None
+
+        price_data     = prop.get("price", {})
+        price_value    = price_data.get("value")
+        price_currency = price_data.get("currency", "EGP")
+        price_period   = (price_data.get("period") or "monthly").lower()
+        if price_period in ("yearly", "annual", "year") and price_value:
+            price_value  = round(price_value / 12)
+            price_period = "monthly"
+
+        area_sqm  = prop.get("area") or prop.get("size")
+        if not area_sqm:
+            fs = ld_main.get("floorSize", {})
+            if str(fs.get("unitText", "")).lower() == "sqm":
+                area_sqm = fs.get("value")
+
+        bedrooms  = prop.get("bedrooms")  or prop.get("bedroom_count")
+        bathrooms = prop.get("bathrooms") or prop.get("bathroom_count")
+        if bedrooms is None or bathrooms is None:
+            text = soup.get_text(" ", strip=True)
+            if bedrooms is None:
+                bm = re.search(r"Bedrooms?\s*(\d+)", text)
+                if bm: bedrooms = int(bm.group(1))
+            if bathrooms is None:
+                btm = re.search(r"Bathrooms?\s*(\d+)", text)
+                if btm: bathrooms = int(btm.group(1))
+
+        coords    = loc.get("coordinates", {})
+        latitude  = coords.get("lat")
+        longitude = coords.get("lon")
+        if latitude is None:
+            geo = ld_main.get("geo", {})
+            latitude  = geo.get("latitude")
+            longitude = geo.get("longitude")
+
+        images = []
+        for img in prop.get("images", {}).get("property", []):
+            img_url = img.get("full") or img.get("medium")
+            if img_url and img_url not in images:
+                images.append(img_url)
+
+        agent = agency = None
+        offers = ld_main.get("offers", [])
+        if offers:
+            offered_by  = offers[0].get("offeredBy", {})
+            agent_name  = offered_by.get("name")
+            agent_phone = offered_by.get("telephone")
+            agency_name = offered_by.get("parentOrganization", {}).get("name")
+            if agent_name:
+                agent = {"name": agent_name, "phone": agent_phone} if agent_phone else {"name": agent_name}
+            if agency_name:
+                agency = {"name": agency_name}
+
+        doc.update({
+            "property_id":  prop_id,
+            "reference":    prop.get("reference"),
+            "price":        price_value,
+            "currency":     price_currency,
+            "price_period": price_period,
+            "price_raw":    f"{price_value} {price_currency}/{price_period}" if price_value else None,
+            "category":     "rent",
+            "area_sqm":     area_sqm,
+            "bedrooms":     bedrooms,
+            "bathrooms":    bathrooms,
+            "furnished":    prop.get("furnishing") or prop.get("furnished"),
+            "latitude":     latitude,
+            "longitude":    longitude,
+            "images":       images[:20] if images else None,
+            "agent":        agent,
+            "agency":       agency,
+            "url":          url,
+            "source":       "propertyfinder.eg",
+        })
+
     return {k: v for k, v in doc.items() if v is not None}
 
 
@@ -377,9 +391,9 @@ def parse_detail(html: str, url: str) -> dict:
 # SCRAPER
 # ══════════════════════════════════════════════════════════════════
 
-async def scrape_one_listing(page, url: str) -> dict | None:
-    # Intercept images as the browser loads them — browser has CDN session/cookies
-    captured = {}  # image_uuid -> (bytes, content_type)
+async def scrape_one_listing(page, en_url: str) -> dict | None:
+    # Intercept images while loading the EN page (CDN session/cookies in browser)
+    captured = {}  # image_uuid → (bytes, content_type)
 
     async def _capture_image(route, request):
         try:
@@ -387,7 +401,6 @@ async def scrape_one_listing(page, url: str) -> dict | None:
             if response.ok:
                 body = await response.body()
                 ct = (response.headers.get("content-type") or "image/jpeg").split(";")[0]
-                # URL format: .../listing/{LISTING_ID}/{IMAGE_UUID}/{RESOLUTION}.jpg
                 parts = request.url.rstrip("/").split("/")
                 uuid = parts[-2] if len(parts) >= 2 else ""
                 if uuid and uuid not in captured:
@@ -401,7 +414,8 @@ async def scrape_one_listing(page, url: str) -> dict | None:
         _capture_image,
     )
 
-    if not await goto(page, url):
+    # ── English page (via Playwright) ────────────────────────────────
+    if not await goto(page, en_url):
         await page.unroute_all()
         return None
     try:
@@ -409,15 +423,25 @@ async def scrape_one_listing(page, url: str) -> dict | None:
     except Exception:
         await asyncio.sleep(3)
     await scroll(page)
-    html = await page.content()
+    html_en = await page.content()
     await page.unroute_all()
 
-    if "EGP" not in html:
+    if "EGP" not in html_en:
         return None
 
-    doc = parse_detail(html, url)
-    if doc and doc.get("images") and _b2_configured():
-        prop_id = doc.get("property_id") or url
+    doc = parse_detail(html_en, en_url, lang="en")
+    if not doc:
+        return None
+
+    # ── Arabic page (via plain HTTP — PropertyFinder is SSR) ─────────
+    html_ar = await fetch_ar_html(en_url)
+    if html_ar and "EGP" in html_ar:
+        ar_doc = parse_detail(html_ar, en_url.replace("/en/plp/", "/ar/plp/"), lang="ar")
+        doc.update(ar_doc)
+
+    # ── Upload captured images to B2 ─────────────────────────────────
+    if doc.get("images") and _b2_configured():
+        prop_id = doc.get("property_id") or en_url
         uploaded = []
         for i, img_url in enumerate(doc["images"]):
             parts = img_url.rstrip("/").split("/")
@@ -431,6 +455,7 @@ async def scrape_one_listing(page, url: str) -> dict | None:
                 log.warning(f"Image not captured for {img_url[:80]}")
                 uploaded.append(img_url)
         doc["images"] = uploaded or None
+
     return doc
 
 
